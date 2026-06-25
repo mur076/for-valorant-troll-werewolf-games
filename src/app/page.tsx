@@ -23,17 +23,34 @@ interface Round {
   inputs: Record<string, PlayerRoundInput>; // プレイヤーID -> 入力＆結果
 }
 
+interface GameSettings {
+  maxRounds: number;
+  scoreCitizenWin: number;
+  scoreTrollWin: number;
+  scoreSpottedBonus: number;
+  enableSpottedBonusOnLose: boolean; // 敗北した市民でもトロール的中時にボーナスを与えるか
+}
+
 interface GameState {
   players: Player[];
   rounds: Round[];
   currentRound: number; // 進行中のラウンド番号 (1~10)
   isFinished: boolean;
   timestamp: number;
+  settings: GameSettings;
 }
 
 // --- 定数 ---
 const STORAGE_KEY = "valo_troll_score_game";
 const TTL_MS = 3 * 24 * 60 * 60 * 1000; // 3日間 (72時間)
+
+const DEFAULT_SETTINGS: GameSettings = {
+  maxRounds: 10,
+  scoreCitizenWin: 2,
+  scoreTrollWin: 4,
+  scoreSpottedBonus: 1,
+  enableSpottedBonusOnLose: false, // デフォルトは敗北時0点
+};
 
 // UTF-8文字列を安全にBase64エンコードする関数
 const safeBtoa = (str: string): string => {
@@ -69,9 +86,7 @@ export default function TrollWerewolfApp() {
   const [notification, setNotification] = useState<string | null>(null);
   
   const showToast = (message: string) => {
-    setTimeout(() => {
-      setNotification(message);
-    }, 0);
+    setNotification(message);
     setTimeout(() => {
       setNotification((prev) => (prev === message ? null : prev));
     }, 4000);
@@ -101,10 +116,11 @@ export default function TrollWerewolfApp() {
               currentRound: parsed.currentRound || 1,
               isFinished: !!parsed.isFinished,
               timestamp: parsed.timestamp || Date.now(),
+              settings: { ...DEFAULT_SETTINGS, ...parsed.settings }, // 各設定項目単位でマージ
             };
           }
-        } catch (e) {
-          console.error("Failed to parse room data from URL", e);
+        } catch {
+          console.error("Failed to parse room data from URL");
         }
       }
     }
@@ -118,10 +134,13 @@ export default function TrollWerewolfApp() {
         if (now - parsed.timestamp > TTL_MS) {
           localStorage.removeItem(STORAGE_KEY);
         } else {
-          return parsed;
+          return {
+            ...parsed,
+            settings: { ...DEFAULT_SETTINGS, ...parsed.settings }, // 各設定項目単位でマージ
+          };
         }
-      } catch (e) {
-        console.error("Failed to load game from localStorage", e);
+      } catch {
+        console.error("Failed to load game from localStorage");
       }
     }
     return null;
@@ -133,6 +152,8 @@ export default function TrollWerewolfApp() {
     return !!urlParams.get("room");
   });
 
+  const [isMounted, setIsMounted] = useState<boolean>(false);
+
   const [tempPlayerNames, setTempPlayerNames] = useState<string[]>([
     "",
     "",
@@ -140,6 +161,9 @@ export default function TrollWerewolfApp() {
     "",
     "",
   ]);
+
+  // 設定用の一時フォームステート
+  const [tempSettings, setTempSettings] = useState<GameSettings>({ ...DEFAULT_SETTINGS });
 
   // ラウンド入力用の一時ステート
   const [roundTrollId, setRoundTrollId] = useState<string>("p1");
@@ -151,17 +175,26 @@ export default function TrollWerewolfApp() {
 
   // --- 初期ロード時のトースト通知 ---
   useEffect(() => {
+    setTimeout(() => {
+      setIsMounted(true);
+    }, 0);
     if (typeof window === "undefined") return;
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.get("room")) {
-      showToast("共有データを読み込みました（閲覧モード）");
+      const timer = setTimeout(() => {
+        showToast("共有データを読み込みました（閲覧モード）");
+      }, 100);
+      return () => clearTimeout(timer);
     } else {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         try {
           const parsed = JSON.parse(saved);
           if (Date.now() - parsed.timestamp > TTL_MS) {
-            showToast("セッション有効期限（3日）が切れたため、データを初期化しました");
+            const timer = setTimeout(() => {
+              showToast("セッション有効期限（3日）が切れたため、データを初期化しました");
+            }, 100);
+            return () => clearTimeout(timer);
           }
         } catch {
           // ignore
@@ -177,7 +210,7 @@ export default function TrollWerewolfApp() {
     return other ? other.id : "";
   };
 
-  // --- ゲーム開始 (プレイヤー登録) ---
+  // --- ゲーム開始 (プレイヤー登録＆設定適用) ---
   const handleStartGame = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const finalPlayers: Player[] = tempPlayerNames.map((name, index) => {
@@ -195,6 +228,13 @@ export default function TrollWerewolfApp() {
       currentRound: 1,
       isFinished: false,
       timestamp: Date.now(),
+      settings: {
+        maxRounds: Math.max(1, tempSettings.maxRounds),
+        scoreCitizenWin: tempSettings.scoreCitizenWin,
+        scoreTrollWin: tempSettings.scoreTrollWin,
+        scoreSpottedBonus: tempSettings.scoreSpottedBonus,
+        enableSpottedBonusOnLose: tempSettings.enableSpottedBonusOnLose,
+      },
     };
 
     setGameState(newState);
@@ -209,9 +249,17 @@ export default function TrollWerewolfApp() {
     return [...gameState.players].sort((a, b) => b.totalScore - a.totalScore);
   }, [gameState]);
 
+  // 最下位の合計スコアを算出
+  const underdogScore = useMemo(() => {
+    if (!gameState || gameState.rounds.length === 0) return -1;
+    return Math.min(...gameState.players.map((p) => p.totalScore));
+  }, [gameState]);
+
   // --- ラウンド確定 & スコア計算 ---
   const handleConfirmRound = () => {
     if (!gameState) return;
+
+    const { scoreCitizenWin, scoreTrollWin, scoreSpottedBonus, enableSpottedBonusOnLose, maxRounds } = gameState.settings;
 
     // 各プレイヤーのこのラウンドの入力＆スコアを計算
     const roundInputs: Record<string, PlayerRoundInput> = {};
@@ -230,20 +278,26 @@ export default function TrollWerewolfApp() {
         ? roundWinningTeam === "troll"
         : roundWinningTeam === "citizen";
 
-      // 得点計算
+      // 得点計算 (設定された配点ルールを使用)
       let score = 0;
       if (isWin) {
         if (isTroll) {
-          score = 4; // トロールで勝利: +4点
+          score = scoreTrollWin; // トロールで勝利
         } else {
-          score = 2; // 市民で勝利: +2点
-          // 投票先が本当のトロールと一致していたら、トロール見破りボーナス +1点
+          score = scoreCitizenWin; // 市民で勝利
+          // 投票先が本当のトロールと一致していたら、トロール見破りボーナス
           if (votedFor === roundTrollId) {
-            score += 1;
+            score += scoreSpottedBonus;
           }
         }
       } else {
-        score = 0; // 敗北: 0点
+        // 敗北した場合
+        // 敗北した市民プレイヤーがトロールを的中させ、かつ「敗北時も見破りボーナスを適用する」トグルがONの場合
+        if (!isTroll && votedFor === roundTrollId && enableSpottedBonusOnLose) {
+          score = scoreSpottedBonus;
+        } else {
+          score = 0; // それ以外は0点
+        }
       }
 
       roundInputs[player.id] = {
@@ -267,9 +321,10 @@ export default function TrollWerewolfApp() {
     };
 
     const nextRoundNumber = gameState.currentRound + 1;
-    const isFinished = gameState.currentRound >= 10;
+    const isFinished = gameState.currentRound >= maxRounds;
 
     const newState: GameState = {
+      ...gameState,
       players: updatedPlayers,
       rounds: [...gameState.rounds, newRound],
       currentRound: isFinished ? gameState.currentRound : nextRoundNumber,
@@ -292,6 +347,7 @@ export default function TrollWerewolfApp() {
       localStorage.removeItem(STORAGE_KEY);
       setGameState(null);
       setTempPlayerNames(["", "", "", "", ""]);
+      setTempSettings({ ...DEFAULT_SETTINGS });
       setIsReadOnly(false);
       setRoundVotes({});
       setRoundTrollId("p1");
@@ -315,6 +371,7 @@ export default function TrollWerewolfApp() {
       rounds: gameState.rounds,
       currentRound: gameState.currentRound,
       isFinished: gameState.isFinished,
+      settings: gameState.settings,
     };
 
     const encoded = safeBtoa(JSON.stringify(shareData));
@@ -347,6 +404,15 @@ export default function TrollWerewolfApp() {
     window.history.replaceState({}, "", window.location.pathname);
     showToast("このデータを元に、編集の引き継ぎが完了しました！");
   };
+
+  if (!isMounted) {
+    return (
+      <div className="relative min-h-screen bg-val-black text-val-light cyber-bg scanline flex flex-col font-sans justify-center items-center">
+        {/* VALORANT風のサイバーなローディングインジケータ */}
+        <div className="w-10 h-10 border-4 border-val-red border-t-transparent rounded-full animate-spin"></div>
+      </div>
+    );
+  }
 
   return (
     <div className="relative min-h-screen bg-val-black text-val-light cyber-bg scanline flex flex-col font-sans">
@@ -418,53 +484,135 @@ export default function TrollWerewolfApp() {
       <main className="flex-1 p-4 md:p-8 max-w-7xl mx-auto w-full flex flex-col gap-6 md:gap-8">
         
         {!gameState ? (
-          /* ==================== 1. プレイヤー登録画面 ==================== */
-          <div className="max-w-xl mx-auto w-full my-auto py-12">
-            <div className="bg-val-gray/40 border border-val-red/20 rounded p-6 md:p-8 backdrop-blur-md relative overflow-hidden val-clip-top-right">
-              {/* 装飾用の赤いライン */}
-              <div className="absolute top-0 right-0 w-32 h-1 bg-val-red"></div>
+          /* ==================== 1. プレイヤー登録 ＆ 設定画面 ==================== */
+          <div className="max-w-4xl mx-auto w-full py-8">
+            <form onSubmit={handleStartGame} className="grid grid-cols-1 md:grid-cols-2 gap-6 md:gap-8">
               
-              <h2 className="text-xl font-bold tracking-widest text-val-red uppercase mb-2">PLAYER REGISTRATION</h2>
-              <p className="text-xs text-zinc-400 mb-6 font-mono">トロール人狼に参加する5人のプレイヤー名を入力してください（未入力の場合は自動設定されます）</p>
+              {/* プレイヤー名登録カード */}
+              <div className="bg-val-gray/40 border border-val-red/20 rounded p-6 md:p-8 backdrop-blur-md relative overflow-hidden val-clip-top-right">
+                <div className="absolute top-0 right-0 w-32 h-1 bg-val-red"></div>
+                
+                <h2 className="text-xl font-bold tracking-widest text-val-red uppercase mb-2">PLAYER REGISTRATION</h2>
+                <p className="text-xs text-zinc-400 mb-6 font-mono">トロール人狼に参加する5人のプレイヤー名を入力（プレースホルダー名での開始も可能）</p>
 
-              <form onSubmit={handleStartGame} className="space-y-4">
-                {tempPlayerNames.map((name, index) => (
-                  <div key={index} className="flex flex-col gap-1.5">
-                    <label className="text-xs font-mono text-zinc-400 flex justify-between">
-                      <span>PLAYER 0{index + 1}</span>
-                      {index === 0 && <span className="text-val-red">HOST</span>}
-                    </label>
-                    <div className="relative">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-val-red font-mono text-sm font-bold">
-                        {"//"}
-                      </span>
+                <div className="space-y-4">
+                  {tempPlayerNames.map((name, index) => (
+                    <div key={index} className="flex flex-col gap-1.5">
+                      <label className="text-xs font-mono text-zinc-400 flex justify-between">
+                        <span>PLAYER 0{index + 1}</span>
+                        {index === 0 && <span className="text-val-red">HOST</span>}
+                      </label>
+                      <div className="relative">
+                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-val-red font-mono text-sm font-bold">
+                          {"//"}
+                        </span>
+                        <input
+                          type="text"
+                          value={name}
+                          onChange={(e) => {
+                            const val = [...tempPlayerNames];
+                            val[index] = e.target.value;
+                            setTempPlayerNames(val);
+                          }}
+                          placeholder={`プレイヤー ${index + 1}`}
+                          maxLength={15}
+                          className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-red text-val-light px-9 py-2.5 rounded font-medium focus:outline-none transition-colors text-sm placeholder-zinc-600"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* ゲームルール・スコア設定カード */}
+              <div className="bg-val-gray/40 border border-zinc-800 rounded p-6 md:p-8 backdrop-blur-md relative overflow-hidden val-clip-top-right flex flex-col justify-between">
+                <div className="absolute top-0 right-0 w-32 h-1 bg-val-cyan"></div>
+                
+                <div>
+                  <h2 className="text-xl font-bold tracking-widest text-val-cyan uppercase mb-2">GAME SETTINGS</h2>
+                  <p className="text-xs text-zinc-400 mb-6 font-mono">対戦回数と得点配分のカスタム設定</p>
+
+                  <div className="space-y-4">
+                    {/* Q. 対戦回数 */}
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-mono text-zinc-400">総ラウンド数 (回戦数)</label>
                       <input
-                        type="text"
-                        value={name}
-                        onChange={(e) => {
-                          const val = [...tempPlayerNames];
-                          val[index] = e.target.value;
-                          setTempPlayerNames(val);
-                        }}
-                        placeholder={`プレイヤー ${index + 1}`}
-                        maxLength={15}
-                        className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-red text-val-light px-9 py-2.5 rounded font-medium focus:outline-none transition-colors text-sm placeholder-zinc-600"
+                        type="number"
+                        min={1}
+                        max={50}
+                        value={tempSettings.maxRounds}
+                        onChange={(e) => setTempSettings({ ...tempSettings, maxRounds: parseInt(e.target.value) || 10 })}
+                        className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-cyan text-val-light px-4 py-2.5 rounded font-mono focus:outline-none transition-colors text-sm"
                       />
                     </div>
+
+                    {/* Q. 市民勝利点 */}
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-mono text-zinc-400">市民勝利ポイント (WIN)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={10}
+                        value={tempSettings.scoreCitizenWin}
+                        onChange={(e) => setTempSettings({ ...tempSettings, scoreCitizenWin: parseInt(e.target.value) || 0 })}
+                        className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-cyan text-val-light px-4 py-2.5 rounded font-mono focus:outline-none transition-colors text-sm"
+                      />
+                    </div>
+
+                    {/* Q. トロール勝利点 */}
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-mono text-zinc-400">トロール勝利ポイント (WIN)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={10}
+                        value={tempSettings.scoreTrollWin}
+                        onChange={(e) => setTempSettings({ ...tempSettings, scoreTrollWin: parseInt(e.target.value) || 0 })}
+                        className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-cyan text-val-light px-4 py-2.5 rounded font-mono focus:outline-none transition-colors text-sm"
+                      />
+                    </div>
+
+                    {/* Q. 見破りボーナス */}
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-mono text-zinc-400">トロール見破りボーナス (BONUS)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={10}
+                        value={tempSettings.scoreSpottedBonus}
+                        onChange={(e) => setTempSettings({ ...tempSettings, scoreSpottedBonus: parseInt(e.target.value) || 0 })}
+                        className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-cyan text-val-light px-4 py-2.5 rounded font-mono focus:outline-none transition-colors text-sm"
+                      />
+                    </div>
+
+                    {/* Q. 敗北時見破りボーナス適用トグル */}
+                    <div className="flex items-center gap-2.5 bg-val-black/40 border border-zinc-800 rounded px-4 py-3 mt-2">
+                      <input
+                        type="checkbox"
+                        id="enableSpottedBonusOnLose"
+                        checked={tempSettings.enableSpottedBonusOnLose}
+                        onChange={(e) => setTempSettings({ ...tempSettings, enableSpottedBonusOnLose: e.target.checked })}
+                        className="w-4 h-4 text-val-cyan bg-val-black border-zinc-700 rounded focus:ring-val-cyan focus:outline-none accent-val-cyan cursor-pointer"
+                      />
+                      <label htmlFor="enableSpottedBonusOnLose" className="text-xs font-mono text-zinc-400 cursor-pointer select-none">
+                        敗北した市民でもトロール的中時はボーナス適用
+                      </label>
+                    </div>
                   </div>
-                ))}
+                </div>
 
                 <button
                   type="submit"
-                  className="w-full mt-6 bg-val-red hover:bg-val-red/90 text-val-light font-black text-sm uppercase tracking-widest py-3 transition-colors duration-300 val-clip-button border-b-4 border-black/40 shadow-xl shadow-val-red/10 flex justify-center items-center gap-2"
+                  className="w-full mt-8 bg-val-red hover:bg-val-red/90 text-val-light font-black text-sm uppercase tracking-widest py-3.5 transition-colors duration-300 val-clip-button border-b-4 border-black/40 shadow-xl shadow-val-red/10 flex justify-center items-center gap-2"
                 >
-                  ゲーム開始 (10回戦)
+                  ゲーム開始 ({tempSettings.maxRounds}回戦)
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
                   </svg>
                 </button>
-              </form>
-            </div>
+              </div>
+
+            </form>
           </div>
         ) : (
           /* ==================== 2. ゲーム進行中画面 ==================== */
@@ -473,42 +621,75 @@ export default function TrollWerewolfApp() {
             {/* --- 左カラム (登録プレイヤー状況 / スコア操作など) (6 / 12) --- */}
             <div className="lg:col-span-7 flex flex-col gap-6 md:gap-8">
               
-              {/* 10回戦終了時の優勝リザルト */}
+              {/* 最終ラウンド終了時の優勝リザルト */}
               {gameState.isFinished ? (
                 <div className="bg-val-gray/40 border-2 border-val-cyan/60 rounded p-6 backdrop-blur-md relative overflow-hidden val-clip-top-right shadow-2xl shadow-val-cyan/5">
                   <div className="absolute top-0 right-0 w-24 h-1 bg-val-cyan"></div>
                   <div className="text-center py-6">
                     <span className="text-val-cyan text-xs font-mono tracking-widest uppercase">MATCH COMPLETED</span>
                     <h2 className="text-3xl font-black text-val-light tracking-wider mt-2 mb-6 uppercase">
-                      🎉 優勝者発表 🎉
+                      🎉 対戦終了リザルト 🎉
                     </h2>
 
                     {/* 最多得点者の検出 */}
                     {(() => {
-                      const maxScore = Math.max(...gameState.players.map((p) => p.totalScore));
+                      const scores = gameState.players.map((p) => p.totalScore);
+                      const maxScore = Math.max(...scores);
+                      const minScore = Math.min(...scores);
+                      
                       const winners = gameState.players.filter((p) => p.totalScore === maxScore);
+                      const underdogs = gameState.players.filter((p) => p.totalScore === minScore);
 
                       return (
-                        <div className="flex flex-col items-center gap-4">
-                          <div className="flex flex-wrap justify-center gap-4">
-                            {winners.map((winner) => (
-                              <div key={winner.id} className="relative group px-8 py-5 bg-val-black/75 border border-val-cyan/40 rounded val-clip-path min-w-[200px] flex flex-col items-center shadow-lg">
-                                <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-val-cyan text-val-black text-[10px] font-black tracking-widest px-2.5 py-0.5 rounded">
-                                  CHAMPION
+                        <div className="flex flex-col items-center gap-6">
+                          
+                          {/* 優勝者カード */}
+                          <div className="w-full">
+                            <span className="text-[10px] font-mono tracking-widest text-zinc-500 uppercase block mb-2">CHAMPIONS</span>
+                            <div className="flex flex-wrap justify-center gap-4">
+                              {winners.map((winner) => (
+                                <div key={winner.id} className="relative group px-8 py-5 bg-yellow-500/5 border border-yellow-500/30 rounded val-clip-path min-w-[200px] flex flex-col items-center shadow-lg shadow-yellow-500/5">
+                                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-yellow-500 text-val-black text-[10px] font-black tracking-widest px-2.5 py-0.5 rounded">
+                                    CHAMPION
+                                  </div>
+                                  <span className="text-3xl mt-2">👑</span>
+                                  <span className="text-2xl font-bold tracking-wide mt-2 text-yellow-500">
+                                    {winner.name}
+                                  </span>
+                                  <span className="text-sm font-mono text-zinc-400 mt-1">
+                                    {winner.totalScore} PTS
+                                  </span>
                                 </div>
-                                <span className="text-3xl mt-2">👑</span>
-                                <span className="text-2xl font-bold tracking-wide mt-2 text-val-cyan">
-                                  {winner.name}
-                                </span>
-                                <span className="text-sm font-mono text-zinc-400 mt-1">
-                                  {winner.totalScore} PTS
-                                </span>
-                              </div>
-                            ))}
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* 最下位カード (ECO AWARD) */}
+                          <div className="w-full border-t border-zinc-800/80 pt-6">
+                            <span className="text-[10px] font-mono tracking-widest text-zinc-500 uppercase block mb-2">ECO AWARD (UNDERDOG)</span>
+                            <div className="flex flex-wrap justify-center gap-4">
+                              {underdogs.map((ud) => (
+                                <div key={ud.id} className="relative group px-6 py-4 bg-zinc-800/20 border border-zinc-700/50 rounded val-clip-path min-w-[180px] flex flex-col items-center shadow-md">
+                                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-zinc-700 text-zinc-300 text-[9px] font-black tracking-widest px-2 py-0.5 rounded">
+                                    ECO PLAYER
+                                  </div>
+                                  <span className="text-2xl mt-1">💀</span>
+                                  <span className="text-lg font-bold tracking-wide mt-1 text-zinc-400">
+                                    {ud.name}
+                                  </span>
+                                  <span className="text-xs font-mono text-zinc-500">
+                                    {ud.totalScore} PTS
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                            <p className="text-[11px] text-zinc-500 mt-3 font-mono">
+                              エコラウンドの達人。次はハーフアーマーとクラシックで耐え忍ぼう。
+                            </p>
                           </div>
                           
-                          <p className="text-zinc-400 text-xs mt-6 max-w-md mx-auto leading-relaxed">
-                            全10回戦にわたる熱いトロール人狼バトルが終了しました！お疲れ様でした。下の「データ破棄」ボタンから、いつでも新規ゲームを開始できます。
+                          <p className="text-zinc-500 text-[10px] mt-2 max-w-lg mx-auto leading-relaxed font-mono uppercase tracking-wider">
+                            RULE: {gameState.settings.maxRounds} ROUNDS | CITIZEN WIN +{gameState.settings.scoreCitizenWin} | TROLL WIN +{gameState.settings.scoreTrollWin} | BONUS +{gameState.settings.scoreSpottedBonus} | BONUS ON LOSE: {gameState.settings.enableSpottedBonusOnLose ? "ON" : "OFF"}
                           </p>
                         </div>
                       );
@@ -531,7 +712,7 @@ export default function TrollWerewolfApp() {
                     <div className="text-right">
                       <span className="block text-[10px] text-zinc-500 font-mono">PROGRESS</span>
                       <span className="text-xl font-mono font-bold text-val-red">
-                        {gameState.currentRound}<span className="text-zinc-600 text-sm">/10</span>
+                        {gameState.currentRound}<span className="text-zinc-600 text-sm">/{gameState.settings.maxRounds}</span>
                       </span>
                     </div>
                   </div>
@@ -586,7 +767,7 @@ export default function TrollWerewolfApp() {
                                 : "bg-val-black/60 border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-val-light"
                             }`}
                           >
-                            市民チームの勝ち (+2点)
+                            市民チームの勝ち (+{gameState.settings.scoreCitizenWin}点)
                           </button>
                           <button
                             type="button"
@@ -597,7 +778,7 @@ export default function TrollWerewolfApp() {
                                 : "bg-val-black/60 border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-val-light"
                             }`}
                           >
-                            トロールの勝ち (+4点)
+                            トロールの勝ち (+{gameState.settings.scoreTrollWin}点)
                           </button>
                         </div>
                       </div>
@@ -608,7 +789,10 @@ export default function TrollWerewolfApp() {
                           <label className="text-xs font-mono text-val-red tracking-wider uppercase">
                             Q3. 各プレイヤーがトロールだと思って投票した相手は？
                           </label>
-                          <span className="text-[10px] text-zinc-500 font-mono">市民がトロールを見破ると+1点ボーナス</span>
+                          <span className="text-[10px] text-zinc-500 font-mono">
+                            的中時ボーナス +{gameState.settings.scoreSpottedBonus}点 
+                            {gameState.settings.enableSpottedBonusOnLose && " (敗北時も適用)"}
+                          </span>
                         </div>
 
                         <div className="space-y-3 bg-val-black/40 border border-zinc-800/80 rounded p-4">
@@ -678,11 +862,13 @@ export default function TrollWerewolfApp() {
                 
                 <h2 className="text-xl font-bold tracking-widest text-val-cyan uppercase mb-2 flex items-center gap-2">
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 001.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 00.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z" />
                   </svg>
                   REAL-TIME LEADERBOARD
                 </h2>
-                <p className="text-xs text-zinc-400 mb-6 font-mono">合計ポイントに基づくプレイヤーランキング</p>
+                <p className="text-xs text-zinc-400 mb-6 font-mono uppercase tracking-wider">
+                  SETTINGS: {gameState.settings.maxRounds} ROUNDS
+                </p>
 
                 {/* スコアリスト */}
                 <div className="space-y-3">
@@ -706,6 +892,9 @@ export default function TrollWerewolfApp() {
                       borderClass = "border-amber-700/20 bg-amber-700/5";
                     }
 
+                    // 最下位(UNDERDOG)の判定: 少なくとも1回はゲームが進行しており、スコアが最下位値と一致する場合
+                    const isUnderdog = underdogScore !== -1 && player.totalScore === underdogScore;
+
                     return (
                       <div
                         key={player.id}
@@ -719,6 +908,11 @@ export default function TrollWerewolfApp() {
                             <span className="font-bold tracking-wide text-sm flex items-center gap-1.5">
                               {player.name}
                               {rankIcon && <span className="text-xs">{rankIcon}</span>}
+                              {isUnderdog && (
+                                <span className="text-[9px] font-mono font-bold bg-zinc-800/80 text-zinc-500 border border-zinc-700 px-1.5 py-0.2 rounded ml-1 animate-pulse">
+                                  UNDERDOG
+                                </span>
+                              )}
                             </span>
                             <span className="text-[10px] text-zinc-500 font-mono">PLAYER ID: {player.id.toUpperCase()}</span>
                           </div>
@@ -760,6 +954,32 @@ export default function TrollWerewolfApp() {
                   const winnerBadgeColor = round.winningTeam === "citizen" ? "bg-val-cyan/10 text-val-cyan border-val-cyan/20" : "bg-val-red/10 text-val-red border-val-red/20";
                   const trollName = gameState.players.find((p) => p.id === round.trollPlayerId)?.name || "不明";
 
+                  // このラウンド終了時点での各プレイヤーの累計スコアを計算
+                  const cumulativeScores: Record<string, number> = {};
+                  gameState.players.forEach((p) => {
+                    cumulativeScores[p.id] = 0;
+                  });
+
+                  for (let i = 0; i < round.roundNumber; i++) {
+                    const r = gameState.rounds[i];
+                    if (r) {
+                      gameState.players.forEach((p) => {
+                        const input = r.inputs[p.id];
+                        if (input) {
+                          cumulativeScores[p.id] += input.score;
+                        }
+                      });
+                    }
+                  }
+
+                  const scoresArray = Object.values(cumulativeScores);
+                  const minScoreAtRound = scoresArray.length > 0 ? Math.min(...scoresArray) : 0;
+                  const underdogsAtRound = gameState.players
+                    .filter((p) => cumulativeScores[p.id] === minScoreAtRound)
+                    .map((p) => p.name);
+
+                  const underdogText = underdogsAtRound.join(", ");
+
                   return (
                     <div key={round.roundNumber} className="border border-zinc-800/80 rounded bg-val-black/40 overflow-hidden val-clip-path transition-all duration-300">
                       
@@ -768,7 +988,7 @@ export default function TrollWerewolfApp() {
                         onClick={() => setOpenAccordion(isOpen ? null : round.roundNumber)}
                         className="w-full px-5 py-3.5 flex items-center justify-between gap-4 text-left hover:bg-val-gray/25 transition-colors duration-200"
                       >
-                        <div className="flex flex-wrap items-center gap-3">
+                        <div className="flex flex-wrap items-center gap-4">
                           <span className="text-sm font-black font-mono text-val-red uppercase tracking-wider">
                             第 {round.roundNumber} 回戦
                           </span>
@@ -777,6 +997,9 @@ export default function TrollWerewolfApp() {
                           </span>
                           <span className="text-xs text-zinc-400">
                             トロール: <span className="font-semibold text-val-light">{trollName}</span>
+                          </span>
+                          <span className="text-xs text-zinc-500 font-mono hidden sm:inline-block border-l border-zinc-850 pl-3">
+                            最下位: <span className="text-zinc-400 font-bold">{underdogText}</span> ({minScoreAtRound}点)
                           </span>
                         </div>
 
@@ -797,6 +1020,13 @@ export default function TrollWerewolfApp() {
                       {/* アコーディオン詳細パネル */}
                       {isOpen && (
                         <div className="px-5 pb-5 pt-2 border-t border-zinc-900 bg-val-black/60 space-y-3">
+                          {/* 各ラウンド終了時点の最下位サマリー */}
+                          <div className="flex flex-wrap items-center justify-between border-b border-zinc-900/60 pb-2 text-[10px] font-mono text-zinc-500">
+                            <span>ROUND SUMMARY</span>
+                            <span>
+                              このラウンド終了時の最下位: <span className="text-val-cyan font-bold">{underdogText}</span> (累計 {minScoreAtRound} 点)
+                            </span>
+                          </div>
                           <div className="grid grid-cols-1 sm:grid-cols-5 gap-3.5 mt-2">
                             {gameState.players.map((p) => {
                               const input = round.inputs[p.id];
