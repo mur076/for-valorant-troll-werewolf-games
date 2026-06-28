@@ -1,90 +1,47 @@
 "use client";
 
 import React, { useState, useEffect, useMemo } from "react";
-
-// --- 型定義 ---
-interface Player {
-  id: string; // "p1" ~ "p5"
-  name: string;
-  totalScore: number;
-}
-
-interface PlayerRoundInput {
-  playerId: string;
-  role: "citizen" | "troll";
-  votedFor: string; // 投票した相手のプレイヤーID
-  score: number; // このラウンドで獲得したスコア
-}
-
-interface Round {
-  roundNumber: number;
-  trollPlayerId: string; // 本当のトロールだったプレイヤーID
-  winningTeam: "citizen" | "troll"; // 勝利したチーム
-  inputs: Record<string, PlayerRoundInput>; // プレイヤーID -> 入力＆結果
-}
-
-interface GameSettings {
-  maxRounds: number;
-  scoreCitizenWin: number;
-  scoreTrollWin: number;
-  scoreSpottedBonus: number;
-  enableSpottedBonusOnLose: boolean; // 敗北した市民でもトロール的中時にボーナスを与えるか
-}
-
-interface GameState {
-  players: Player[];
-  rounds: Round[];
-  currentRound: number; // 進行中のラウンド番号 (1~10)
-  isFinished: boolean;
-  timestamp: number;
-  settings: GameSettings;
-}
+import { AgentData, GameSettings, Player, Round, PlayerRoundInput, GameState } from "@/types/game";
+import { safeBtoa, safeAtob, getDefaultVoteFor } from "@/utils/helpers";
+import GameSetup from "@/components/GameSetup";
+import Leaderboard from "@/components/Leaderboard";
+import RoundInputForm from "@/components/RoundInputForm";
+import MatchHistory from "@/components/MatchHistory";
 
 // --- 定数 ---
 const STORAGE_KEY = "valo_troll_score_game";
 const TTL_MS = 3 * 24 * 60 * 60 * 1000; // 3日間 (72時間)
 
 const DEFAULT_SETTINGS: GameSettings = {
-  maxRounds: 10,
+  maxRounds: 7, // デフォルト7戦
   scoreCitizenWin: 2,
-  scoreTrollWin: 4,
-  scoreSpottedBonus: 1,
-  enableSpottedBonusOnLose: false, // デフォルトは敗北時0点
-};
-
-// UTF-8文字列を安全にBase64エンコードする関数
-const safeBtoa = (str: string): string => {
-  try {
-    return btoa(
-      encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (_, p1) =>
-        String.fromCharCode(parseInt(p1, 16))
-      )
-    );
-  } catch (e) {
-    console.error("Base64 encoding error", e);
-    return "";
-  }
-};
-
-// Base64から安全にUTF-8文字列をデコードする関数
-const safeAtob = (str: string): string => {
-  try {
-    return decodeURIComponent(
-      atob(str)
-        .split("")
-        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
-        .join("")
-    );
-  } catch (e) {
-    console.error("Base64 decoding error", e);
-    return "";
-  }
+  scoreTrollWin: 3,
+  scoreSpottedBonus: 2,
+  enableSpottedBonusOnLose: true, // 敗北時も適用ON
+  
+  // 市民有利アドバンスドルール配点
+  scoreTrollSpottedUnanimousPenalty: -3,
+  scoreCitizenPerfectWinBonus: 2,
+  scoreTrollPerfectLosePenalty: -2,
+  scoreCitizenPerfectLosePenalty: -1,
+  scoreTrollPerfectWinBonus: 1,
+  scoreTrollCompleteConcealBonus: 1,
+  scoreCitizenCompleteConcealPenalty: -1,
+  scoreTrollObviousPenalty: -2,
+  scoreTrollArtisticBonus: 1,
 };
 
 export default function TrollWerewolfApp() {
-  // --- トースト通知の制御ステート＆関数 (先頭で宣言) ---
+  // --- 基本ステート ---
+  const [gameState, setGameState] = useState<GameState | null>(null);
+  const [agents, setAgents] = useState<AgentData[]>([]);
+  const [isReadOnly, setIsReadOnly] = useState<boolean>(false);
+  const [isMounted, setIsMounted] = useState<boolean>(false);
+  const [isStateInitialized, setIsStateInitialized] = useState<boolean>(false);
   const [notification, setNotification] = useState<string | null>(null);
-  
+  const [isRulebookOpen, setIsRulebookOpen] = useState<boolean>(false); // ルールブック用
+
+  // --- トースト通知の制御 ---
   const showToast = (message: string) => {
     setNotification(message);
     setTimeout(() => {
@@ -92,31 +49,84 @@ export default function TrollWerewolfApp() {
     }, 4000);
   };
 
-  // --- 初期値の遅延評価 (Lazy Initialization) ---
-  const [gameState, setGameState] = useState<GameState | null>(() => {
-    if (typeof window === "undefined") return null;
+  // 画像アセットのプリロード
+  const preloadAgentAssets = (agentsList: AgentData[]) => {
+    agentsList.forEach((agent) => {
+      if (agent.displayIcon) {
+        const img = new Image();
+        img.src = agent.displayIcon;
+      }
+      if (agent.fullPortrait) {
+        const img = new Image();
+        img.src = agent.fullPortrait;
+      }
+    });
+  };
 
-    // 1. URLパラメータの確認
+  // --- 1. マウント処理 & エージェントAPIフェッチ ---
+  useEffect(() => {
+    setIsMounted(true);
+
+    const fetchAgents = async () => {
+      try {
+        const res = await fetch("https://valorant-api.com/v1/agents?language=ja-JP&isPlayableCharacter=true");
+        const json = await res.json();
+        if (json.status === 200 && Array.isArray(json.data)) {
+          // UUIDの重複排除（Riot APIの仕様でSovaなど同一エージェントが複数エントリーされる場合があるための対策）
+          const seen = new Set<string>();
+          const mapped: AgentData[] = [];
+          
+          json.data.forEach((item: any) => {
+            if (!seen.has(item.uuid)) {
+              seen.add(item.uuid);
+              mapped.push({
+                uuid: item.uuid,
+                displayName: item.displayName,
+                displayIcon: item.displayIcon,
+                fullPortrait: item.fullPortrait || item.fullPortraitV2 || "",
+                backgroundGradientColors: item.backgroundGradientColors || [],
+              });
+            }
+          });
+          
+          setAgents(mapped);
+          preloadAgentAssets(mapped);
+        }
+      } catch (e) {
+        console.error("Failed to fetch agents from Valorant API", e);
+        showToast("エージェント情報の取得に失敗しました。オフラインモードで動作します。");
+      }
+    };
+
+    fetchAgents();
+  }, []);
+
+  // --- 2. ローカルストレージ & URL共有からの状態初期化 (エージェントロード後) ---
+  useEffect(() => {
+    if (!isMounted || isStateInitialized) return;
+    
+    // エージェントデータの読み込みが完了するのを待つ（空でもフォールバックとして次に進む）
+    // APIが返ってこない場合のためのタイムアウトや空配列許容
     const urlParams = new URLSearchParams(window.location.search);
     const roomParam = urlParams.get("room");
+    let loadedState: GameState | null = null;
+    let readOnlyMode = false;
 
+    // A. URLパラメータからの復元
     if (roomParam) {
+      readOnlyMode = true;
       const decoded = safeAtob(roomParam);
       if (decoded) {
         try {
           const parsed = JSON.parse(decoded);
-          if (
-            parsed.players &&
-            Array.isArray(parsed.players) &&
-            parsed.players.length === 5
-          ) {
-            return {
+          if (parsed.players && Array.isArray(parsed.players) && parsed.players.length === 5) {
+            loadedState = {
               players: parsed.players,
               rounds: parsed.rounds || [],
               currentRound: parsed.currentRound || 1,
               isFinished: !!parsed.isFinished,
               timestamp: parsed.timestamp || Date.now(),
-              settings: { ...DEFAULT_SETTINGS, ...parsed.settings }, // 各設定項目単位でマージ
+              settings: { ...DEFAULT_SETTINGS, ...parsed.settings },
             };
           }
         } catch {
@@ -125,116 +135,91 @@ export default function TrollWerewolfApp() {
       }
     }
 
-    // 2. LocalStorageの確認 (URLパラメータがない、またはパース失敗時)
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
-        const parsed: GameState = JSON.parse(saved);
-        const now = Date.now();
-        if (now - parsed.timestamp > TTL_MS) {
-          localStorage.removeItem(STORAGE_KEY);
-        } else {
-          return {
-            ...parsed,
-            settings: { ...DEFAULT_SETTINGS, ...parsed.settings }, // 各設定項目単位でマージ
-          };
-        }
-      } catch {
-        console.error("Failed to load game from localStorage");
-      }
-    }
-    return null;
-  });
-
-  const [isReadOnly, setIsReadOnly] = useState<boolean>(() => {
-    if (typeof window === "undefined") return false;
-    const urlParams = new URLSearchParams(window.location.search);
-    return !!urlParams.get("room");
-  });
-
-  const [isMounted, setIsMounted] = useState<boolean>(false);
-
-  const [tempPlayerNames, setTempPlayerNames] = useState<string[]>([
-    "",
-    "",
-    "",
-    "",
-    "",
-  ]);
-
-  // 設定用の一時フォームステート
-  const [tempSettings, setTempSettings] = useState<GameSettings>({ ...DEFAULT_SETTINGS });
-
-  // ラウンド入力用の一時ステート
-  const [roundTrollId, setRoundTrollId] = useState<string>("p1");
-  const [roundWinningTeam, setRoundWinningTeam] = useState<"citizen" | "troll">("citizen");
-  const [roundVotes, setRoundVotes] = useState<Record<string, string>>({});
-
-  // アコーディオン開閉状態 (ラウンド番号を保持)
-  const [openAccordion, setOpenAccordion] = useState<number | null>(null);
-
-  // --- 初期ロード時のトースト通知 ---
-  useEffect(() => {
-    setTimeout(() => {
-      setIsMounted(true);
-    }, 0);
-    if (typeof window === "undefined") return;
-    const urlParams = new URLSearchParams(window.location.search);
-    if (urlParams.get("room")) {
-      const timer = setTimeout(() => {
-        showToast("共有データを読み込みました（閲覧モード）");
-      }, 100);
-      return () => clearTimeout(timer);
-    } else {
+    // B. LocalStorageからの復元 (URLパラメータがない、または失敗したとき)
+    if (!loadedState) {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         try {
-          const parsed = JSON.parse(saved);
-          if (Date.now() - parsed.timestamp > TTL_MS) {
-            const timer = setTimeout(() => {
+          const parsed: GameState = JSON.parse(saved);
+          const now = Date.now();
+          if (now - parsed.timestamp > TTL_MS) {
+            localStorage.removeItem(STORAGE_KEY);
+            setTimeout(() => {
               showToast("セッション有効期限（3日）が切れたため、データを初期化しました");
             }, 100);
-            return () => clearTimeout(timer);
+          } else {
+            loadedState = {
+              ...parsed,
+              settings: { ...DEFAULT_SETTINGS, ...parsed.settings },
+            };
           }
         } catch {
-          // ignore
+          console.error("Failed to load game from localStorage");
         }
       }
     }
-  }, []);
 
-  // 自分自身以外のデフォルトの投票先を取得するヘルパー
-  const getDefaultVoteFor = (playerId: string) => {
-    if (!gameState) return "";
-    const other = gameState.players.find((op) => op.id !== playerId);
-    return other ? other.id : "";
-  };
+    // C. ロードした状態にエージェント詳細情報を結合する
+    if (loadedState) {
+      const resolvedPlayers = loadedState.players.map((p) => {
+        const agentUuid = p.agent?.uuid;
+        if (agentUuid && agents.length > 0) {
+          const latestAgent = agents.find((a) => a.uuid === agentUuid);
+          if (latestAgent) {
+            return { ...p, agent: latestAgent };
+          }
+        }
+        return p;
+      });
 
-  // --- ゲーム開始 (プレイヤー登録＆設定適用) ---
-  const handleStartGame = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const finalPlayers: Player[] = tempPlayerNames.map((name, index) => {
-      const fallbackName = `プレイヤー ${index + 1}`;
-      return {
-        id: `p${index + 1}`,
-        name: name.trim() || fallbackName,
-        totalScore: 0,
-      };
-    });
+      const resolvedRounds = loadedState.rounds.map((round) => {
+        const resolvedInputs: Record<string, PlayerRoundInput> = {};
+        Object.entries(round.inputs).forEach(([playerId, input]) => {
+          let resolvedAgent = input.agent;
+          const agentUuid = input.agent?.uuid;
+          if (agentUuid && agents.length > 0) {
+            const latestAgent = agents.find((a) => a.uuid === agentUuid);
+            if (latestAgent) {
+              resolvedAgent = latestAgent;
+            }
+          }
+          resolvedInputs[playerId] = {
+            ...input,
+            agent: resolvedAgent,
+          };
+        });
+        return {
+          ...round,
+          inputs: resolvedInputs,
+        };
+      });
 
+      setGameState({
+        ...loadedState,
+        players: resolvedPlayers,
+        rounds: resolvedRounds,
+      });
+      setIsReadOnly(readOnlyMode);
+
+      if (readOnlyMode) {
+        setTimeout(() => {
+          showToast("共有データを読み込みました（閲覧モード）");
+        }, 100);
+      }
+    }
+
+    setIsStateInitialized(true);
+  }, [isMounted, agents, isStateInitialized]);
+
+  // --- 3. ゲーム開始 (プレイヤー登録＆設定適用) ---
+  const handleStartGame = (finalPlayers: Player[], gameSettings: GameSettings) => {
     const newState: GameState = {
       players: finalPlayers,
       rounds: [],
       currentRound: 1,
       isFinished: false,
       timestamp: Date.now(),
-      settings: {
-        maxRounds: Math.max(1, tempSettings.maxRounds),
-        scoreCitizenWin: tempSettings.scoreCitizenWin,
-        scoreTrollWin: tempSettings.scoreTrollWin,
-        scoreSpottedBonus: tempSettings.scoreSpottedBonus,
-        enableSpottedBonusOnLose: tempSettings.enableSpottedBonusOnLose,
-      },
+      settings: gameSettings,
     };
 
     setGameState(newState);
@@ -243,60 +228,135 @@ export default function TrollWerewolfApp() {
     showToast("ゲームを開始しました！");
   };
 
-  // --- スコアボードの順位付け (合計スコア順ソート) ---
-  const rankedPlayers = useMemo(() => {
-    if (!gameState) return [];
-    return [...gameState.players].sort((a, b) => b.totalScore - a.totalScore);
-  }, [gameState]);
-
-  // 最下位の合計スコアを算出
-  const underdogScore = useMemo(() => {
-    if (!gameState || gameState.rounds.length === 0) return -1;
-    return Math.min(...gameState.players.map((p) => p.totalScore));
-  }, [gameState]);
-
-  // --- ラウンド確定 & スコア計算 ---
-  const handleConfirmRound = () => {
+  // --- 4. ラウンド確定 & スコア計算 ---
+  const handleConfirmRound = (
+    trollPlayerId: string,
+    winningTeam: "citizen" | "troll",
+    votes: Record<string, string>,
+    roundAgents: Record<string, string>, // プレイヤーID -> エージェントUUID
+    isObviousTroll: boolean,
+    isArtisticTroll: boolean
+  ) => {
     if (!gameState) return;
 
-    const { scoreCitizenWin, scoreTrollWin, scoreSpottedBonus, enableSpottedBonusOnLose, maxRounds } = gameState.settings;
+    const {
+      scoreCitizenWin,
+      scoreTrollWin,
+      scoreSpottedBonus,
+      enableSpottedBonusOnLose,
+      maxRounds,
+      
+      // 新スコアルール
+      scoreTrollSpottedUnanimousPenalty,
+      scoreCitizenPerfectWinBonus,
+      scoreTrollPerfectLosePenalty,
+      scoreCitizenPerfectLosePenalty,
+      scoreTrollPerfectWinBonus,
+      scoreTrollCompleteConcealBonus,
+      scoreCitizenCompleteConcealPenalty,
+      scoreTrollObviousPenalty,
+      scoreTrollArtisticBonus,
+    } = gameState.settings;
 
-    // 各プレイヤーのこのラウンドの入力＆スコアを計算
+    // 各プレイヤーの得票数を集計
+    const voteCounts: Record<string, number> = {};
+    Object.values(votes).forEach((targetId) => {
+      voteCounts[targetId] = (voteCounts[targetId] || 0) + 1;
+    });
+
+    const trollVotes = voteCounts[trollPlayerId] || 0;
+    const maxVotes = Math.max(0, ...Object.values(voteCounts));
+
+    // 市民側の投票勝利（的中）の定義: 本当のトロールが全プレイヤーの中で最多得票（同率含む）かつ1票以上獲得していること
+    const isCitizenVoteWin = trollVotes > 0 && trollVotes === maxVotes;
+
+    // トロール満場一致特定の判定 (市民4人全員がトロールに投票した場合)
+    const isUnanimousSpotted = trollVotes === 4;
+
     const roundInputs: Record<string, PlayerRoundInput> = {};
     const updatedPlayers = gameState.players.map((player) => {
-      const isTroll = player.id === roundTrollId;
+      const isTroll = player.id === trollPlayerId;
       const role = isTroll ? ("troll" as const) : ("citizen" as const);
       
-      // 投票先が未入力、または自分自身だった場合はデフォルトにフォールバック
-      let votedFor = roundVotes[player.id];
+      let votedFor = votes[player.id];
       if (!votedFor || votedFor === player.id) {
-        votedFor = getDefaultVoteFor(player.id);
+        votedFor = getDefaultVoteFor(gameState.players, player.id);
       }
+
+      // このラウンドで使用したエージェントデータを取得
+      const agentUuid = roundAgents[player.id];
+      const roundAgent = agents.find((a) => a.uuid === agentUuid);
 
       // 勝敗の判定
       const isWin = isTroll
-        ? roundWinningTeam === "troll"
-        : roundWinningTeam === "citizen";
+        ? winningTeam === "troll"
+        : winningTeam === "citizen";
 
-      // 得点計算 (設定された配点ルールを使用)
+      const isThisVoterSpottedTroll = !isTroll && votedFor === trollPlayerId;
+
+      // 得点計算
       let score = 0;
-      if (isWin) {
-        if (isTroll) {
-          score = scoreTrollWin; // トロールで勝利
-        } else {
-          score = scoreCitizenWin; // 市民で勝利
-          // 投票先が本当のトロールと一致していたら、トロール見破りボーナス
-          if (votedFor === roundTrollId) {
-            score += scoreSpottedBonus;
-          }
+
+      if (!isTroll) {
+        // 【市民側の得点計算】
+        // 1. 基本勝利点
+        if (isWin) {
+          score += scoreCitizenWin;
         }
+
+        // 2. 個別的中ボーナス (勝利時、または敗北時トグル有効時)
+        if (isThisVoterSpottedTroll && (isWin || enableSpottedBonusOnLose)) {
+          score += scoreSpottedBonus;
+        }
+
+        // 3. 市民完全勝利ボーナス (試合勝利 かつ 投票的中)
+        if (isWin && isCitizenVoteWin) {
+          score += scoreCitizenPerfectWinBonus;
+        }
+
+        // 4. トロール完全勝利ペナルティ (試合敗北 かつ 投票不的中)
+        if (!isWin && !isCitizenVoteWin) {
+          score += scoreCitizenPerfectLosePenalty;
+        }
+
+        // 5. トロール完全隠蔽ペナルティ (試合敗北 かつ トロール得票数0)
+        if (!isWin && trollVotes === 0) {
+          score += scoreCitizenCompleteConcealPenalty;
+        }
+
       } else {
-        // 敗北した場合
-        // 敗北した市民プレイヤーがトロールを的中させ、かつ「敗北時も見破りボーナスを適用する」トグルがONの場合
-        if (!isTroll && votedFor === roundTrollId && enableSpottedBonusOnLose) {
-          score = scoreSpottedBonus;
-        } else {
-          score = 0; // それ以外は0点
+        // 【トロール側の得点計算】
+        // 1. 基本勝利点
+        if (isWin) {
+          score += scoreTrollWin;
+        }
+
+        // 2. 満場一致ペナルティ (4票特定)
+        if (isUnanimousSpotted) {
+          score += scoreTrollSpottedUnanimousPenalty;
+        }
+
+        // 3. 市民投票的中ペナルティ (投票的中時)
+        if (isCitizenVoteWin) {
+          score += scoreTrollPerfectLosePenalty;
+        }
+
+        // 4. トロール完全勝利ボーナス (試合勝利 かつ 投票不的中)
+        if (isWin && !isCitizenVoteWin) {
+          score += scoreTrollPerfectWinBonus;
+        }
+
+        // 5. トロール完全隠蔽大ボーナス (試合勝利 かつ トロール得票数0)
+        if (isWin && trollVotes === 0) {
+          score += scoreTrollCompleteConcealBonus;
+        }
+
+        // 6. トロールプレイ特別評価 (戦犯/芸術的)
+        if (isObviousTroll) {
+          score += scoreTrollObviousPenalty;
+        }
+        if (isArtisticTroll) {
+          score += scoreTrollArtisticBonus;
         }
       }
 
@@ -305,19 +365,25 @@ export default function TrollWerewolfApp() {
         role,
         votedFor,
         score,
+        agent: roundAgent,
+        isObviousTroll: isTroll ? isObviousTroll : undefined,
+        isArtisticTroll: isTroll ? isArtisticTroll : undefined,
       };
 
       return {
         ...player,
         totalScore: player.totalScore + score,
+        agent: roundAgent || player.agent, // スコアボード表示用の最新エージェントも更新
       };
     });
 
     const newRound: Round = {
       roundNumber: gameState.currentRound,
-      trollPlayerId: roundTrollId,
-      winningTeam: roundWinningTeam,
+      trollPlayerId,
+      winningTeam,
       inputs: roundInputs,
+      isObviousTroll,
+      isArtisticTroll,
     };
 
     const nextRoundNumber = gameState.currentRound + 1;
@@ -334,27 +400,16 @@ export default function TrollWerewolfApp() {
 
     setGameState(newState);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(newState));
-
-    // 次のラウンド用にフォーム入力をリセット
-    setRoundWinningTeam("citizen");
-    setRoundVotes({});
     showToast(`第 ${gameState.currentRound} 回戦を確定しました`);
   };
 
-  // --- ゲームデータの破棄 (リセット) ---
+  // --- 5. ゲームデータの破棄 (リセット) ---
   const handleDiscardGame = () => {
     if (window.confirm("これまでのゲームデータをすべて破棄して、最初からやり直しますか？")) {
       localStorage.removeItem(STORAGE_KEY);
       setGameState(null);
-      setTempPlayerNames(["", "", "", "", ""]);
-      setTempSettings({ ...DEFAULT_SETTINGS });
       setIsReadOnly(false);
-      setRoundVotes({});
-      setRoundTrollId("p1");
-      setRoundWinningTeam("citizen");
-      setOpenAccordion(null);
       
-      // URLのパラメータも消去
       if (window.location.search) {
         window.history.replaceState({}, "", window.location.pathname);
       }
@@ -362,13 +417,35 @@ export default function TrollWerewolfApp() {
     }
   };
 
-  // --- 結果をURLで共有 ---
+  // --- 6. 結果をURLで共有 ---
   const handleShareUrl = () => {
     if (!gameState) return;
     
+    // 共有URLの肥大化を防ぐため、プレイヤーのエージェント情報は uuid のみに絞り込む
+    const serializablePlayers = gameState.players.map((p) => ({
+      id: p.id,
+      name: p.name,
+      totalScore: p.totalScore,
+      agent: p.agent ? { uuid: p.agent.uuid } : undefined,
+    }));
+
+    const serializableRounds = gameState.rounds.map((round) => {
+      const compressedInputs: Record<string, any> = {};
+      Object.entries(round.inputs).forEach(([playerId, input]) => {
+        compressedInputs[playerId] = {
+          ...input,
+          agent: input.agent ? { uuid: input.agent.uuid } : undefined,
+        };
+      });
+      return {
+        ...round,
+        inputs: compressedInputs,
+      };
+    });
+
     const shareData = {
-      players: gameState.players,
-      rounds: gameState.rounds,
+      players: serializablePlayers,
+      rounds: serializableRounds,
       currentRound: gameState.currentRound,
       isFinished: gameState.isFinished,
       settings: gameState.settings,
@@ -387,28 +464,27 @@ export default function TrollWerewolfApp() {
       });
   };
 
-  // --- 編集モードへの引き継ぎ ---
+  // --- 7. 編集モードへの引き継ぎ ---
   const handleTakeoverEdit = () => {
     if (!gameState) return;
 
     const newState = {
       ...gameState,
-      timestamp: Date.now(), // タイムスタンプを現在に更新
+      timestamp: Date.now(),
     };
 
     setGameState(newState);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(newState));
     setIsReadOnly(false);
 
-    // URLの ?room=xxx を消去して履歴をクリーンに
     window.history.replaceState({}, "", window.location.pathname);
     showToast("このデータを元に、編集の引き継ぎが完了しました！");
   };
 
+  // マウント前のローディング表示
   if (!isMounted) {
     return (
       <div className="relative min-h-screen bg-val-black text-val-light cyber-bg scanline flex flex-col font-sans justify-center items-center">
-        {/* VALORANT風のサイバーなローディングインジケータ */}
         <div className="w-10 h-10 border-4 border-val-red border-t-transparent rounded-full animate-spin"></div>
       </div>
     );
@@ -432,18 +508,18 @@ export default function TrollWerewolfApp() {
           <div className="flex flex-wrap items-center gap-3">
             <button
               onClick={handleShareUrl}
-              className="px-4 py-2 border border-val-cyan text-val-cyan hover:bg-val-cyan hover:text-val-dark transition-all duration-300 font-mono text-xs uppercase tracking-wider font-bold val-clip-button flex items-center gap-1.5"
+              className="px-4 py-2 border border-val-cyan text-val-cyan hover:bg-val-cyan hover:text-val-dark transition-all duration-300 font-mono text-xs uppercase tracking-wider font-bold val-clip-button flex items-center gap-1.5 cursor-pointer"
             >
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 10.742l4.828-2.414m0 0a3 3 0 10-3.62-4.3l-4.83 2.42m0 0a3 3 0 100 4.6l4.829 2.41m-1.282-1.28l4.828 2.414m-.24 4.316a3 3 0 103.62-4.3L13.5 15" />
               </svg>
               URLで共有
             </button>
             <button
               onClick={handleDiscardGame}
-              className="px-4 py-2 border border-val-red/40 text-val-red hover:border-val-red hover:bg-val-red hover:text-val-light transition-all duration-300 font-mono text-xs uppercase tracking-wider font-bold val-clip-button flex items-center gap-1.5"
+              className="px-4 py-2 border border-val-red/40 text-val-red hover:border-val-red hover:bg-val-red hover:text-val-light transition-all duration-300 font-mono text-xs uppercase tracking-wider font-bold val-clip-button flex items-center gap-1.5 cursor-pointer"
             >
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
               </svg>
               データ破棄
@@ -456,7 +532,7 @@ export default function TrollWerewolfApp() {
       {isReadOnly && gameState && (
         <div className="bg-val-cyan/15 border-b border-val-cyan px-6 py-3 flex flex-col sm:flex-row justify-between items-center gap-3 text-sm z-20">
           <div className="flex items-center gap-2 text-val-cyan">
-            <svg className="w-5 h-5 flex-shrink-0 animate-pulse" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+            <svg className="w-5 h-5 flex-shrink-0 animate-pulse" fill="currentColor" viewBox="0 0 20 20">
               <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
             </svg>
             <span className="font-semibold tracking-wide">
@@ -465,7 +541,7 @@ export default function TrollWerewolfApp() {
           </div>
           <button
             onClick={handleTakeoverEdit}
-            className="px-4 py-1.5 bg-val-cyan hover:bg-val-cyan/85 text-val-black font-bold rounded text-xs uppercase tracking-wider transition-colors shadow-lg shadow-val-cyan/20"
+            className="px-4 py-1.5 bg-val-cyan hover:bg-val-cyan/85 text-val-black font-bold rounded text-xs uppercase tracking-wider transition-colors shadow-lg shadow-val-cyan/20 cursor-pointer"
           >
             このデータをもとに編集を引き継ぐ
           </button>
@@ -483,142 +559,16 @@ export default function TrollWerewolfApp() {
       {/* --- メインコンテンツ --- */}
       <main className="flex-1 p-4 md:p-8 max-w-7xl mx-auto w-full flex flex-col gap-6 md:gap-8">
         
+
+
         {!gameState ? (
           /* ==================== 1. プレイヤー登録 ＆ 設定画面 ==================== */
-          <div className="max-w-4xl mx-auto w-full py-8">
-            <form onSubmit={handleStartGame} className="grid grid-cols-1 md:grid-cols-2 gap-6 md:gap-8">
-              
-              {/* プレイヤー名登録カード */}
-              <div className="bg-val-gray/40 border border-val-red/20 rounded p-6 md:p-8 backdrop-blur-md relative overflow-hidden val-clip-top-right">
-                <div className="absolute top-0 right-0 w-32 h-1 bg-val-red"></div>
-                
-                <h2 className="text-xl font-bold tracking-widest text-val-red uppercase mb-2">PLAYER REGISTRATION</h2>
-                <p className="text-xs text-zinc-400 mb-6 font-mono">トロール人狼に参加する5人のプレイヤー名を入力（プレースホルダー名での開始も可能）</p>
-
-                <div className="space-y-4">
-                  {tempPlayerNames.map((name, index) => (
-                    <div key={index} className="flex flex-col gap-1.5">
-                      <label className="text-xs font-mono text-zinc-400 flex justify-between">
-                        <span>PLAYER 0{index + 1}</span>
-                        {index === 0 && <span className="text-val-red">HOST</span>}
-                      </label>
-                      <div className="relative">
-                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-val-red font-mono text-sm font-bold">
-                          {"//"}
-                        </span>
-                        <input
-                          type="text"
-                          value={name}
-                          onChange={(e) => {
-                            const val = [...tempPlayerNames];
-                            val[index] = e.target.value;
-                            setTempPlayerNames(val);
-                          }}
-                          placeholder={`プレイヤー ${index + 1}`}
-                          maxLength={15}
-                          className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-red text-val-light px-9 py-2.5 rounded font-medium focus:outline-none transition-colors text-sm placeholder-zinc-600"
-                        />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* ゲームルール・スコア設定カード */}
-              <div className="bg-val-gray/40 border border-zinc-800 rounded p-6 md:p-8 backdrop-blur-md relative overflow-hidden val-clip-top-right flex flex-col justify-between">
-                <div className="absolute top-0 right-0 w-32 h-1 bg-val-cyan"></div>
-                
-                <div>
-                  <h2 className="text-xl font-bold tracking-widest text-val-cyan uppercase mb-2">GAME SETTINGS</h2>
-                  <p className="text-xs text-zinc-400 mb-6 font-mono">対戦回数と得点配分のカスタム設定</p>
-
-                  <div className="space-y-4">
-                    {/* Q. 対戦回数 */}
-                    <div className="flex flex-col gap-1.5">
-                      <label className="text-xs font-mono text-zinc-400">総ラウンド数 (回戦数)</label>
-                      <input
-                        type="number"
-                        min={1}
-                        max={50}
-                        value={tempSettings.maxRounds}
-                        onChange={(e) => setTempSettings({ ...tempSettings, maxRounds: parseInt(e.target.value) || 10 })}
-                        className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-cyan text-val-light px-4 py-2.5 rounded font-mono focus:outline-none transition-colors text-sm"
-                      />
-                    </div>
-
-                    {/* Q. 市民勝利点 */}
-                    <div className="flex flex-col gap-1.5">
-                      <label className="text-xs font-mono text-zinc-400">市民勝利ポイント (WIN)</label>
-                      <input
-                        type="number"
-                        min={0}
-                        max={10}
-                        value={tempSettings.scoreCitizenWin}
-                        onChange={(e) => setTempSettings({ ...tempSettings, scoreCitizenWin: parseInt(e.target.value) || 0 })}
-                        className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-cyan text-val-light px-4 py-2.5 rounded font-mono focus:outline-none transition-colors text-sm"
-                      />
-                    </div>
-
-                    {/* Q. トロール勝利点 */}
-                    <div className="flex flex-col gap-1.5">
-                      <label className="text-xs font-mono text-zinc-400">トロール勝利ポイント (WIN)</label>
-                      <input
-                        type="number"
-                        min={0}
-                        max={10}
-                        value={tempSettings.scoreTrollWin}
-                        onChange={(e) => setTempSettings({ ...tempSettings, scoreTrollWin: parseInt(e.target.value) || 0 })}
-                        className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-cyan text-val-light px-4 py-2.5 rounded font-mono focus:outline-none transition-colors text-sm"
-                      />
-                    </div>
-
-                    {/* Q. 見破りボーナス */}
-                    <div className="flex flex-col gap-1.5">
-                      <label className="text-xs font-mono text-zinc-400">トロール見破りボーナス (BONUS)</label>
-                      <input
-                        type="number"
-                        min={0}
-                        max={10}
-                        value={tempSettings.scoreSpottedBonus}
-                        onChange={(e) => setTempSettings({ ...tempSettings, scoreSpottedBonus: parseInt(e.target.value) || 0 })}
-                        className="w-full bg-val-black/80 border border-zinc-700 focus:border-val-cyan text-val-light px-4 py-2.5 rounded font-mono focus:outline-none transition-colors text-sm"
-                      />
-                    </div>
-
-                    {/* Q. 敗北時見破りボーナス適用トグル */}
-                    <div className="flex items-center gap-2.5 bg-val-black/40 border border-zinc-800 rounded px-4 py-3 mt-2">
-                      <input
-                        type="checkbox"
-                        id="enableSpottedBonusOnLose"
-                        checked={tempSettings.enableSpottedBonusOnLose}
-                        onChange={(e) => setTempSettings({ ...tempSettings, enableSpottedBonusOnLose: e.target.checked })}
-                        className="w-4 h-4 text-val-cyan bg-val-black border-zinc-700 rounded focus:ring-val-cyan focus:outline-none accent-val-cyan cursor-pointer"
-                      />
-                      <label htmlFor="enableSpottedBonusOnLose" className="text-xs font-mono text-zinc-400 cursor-pointer select-none">
-                        敗北した市民でもトロール的中時はボーナス適用
-                      </label>
-                    </div>
-                  </div>
-                </div>
-
-                <button
-                  type="submit"
-                  className="w-full mt-8 bg-val-red hover:bg-val-red/90 text-val-light font-black text-sm uppercase tracking-widest py-3.5 transition-colors duration-300 val-clip-button border-b-4 border-black/40 shadow-xl shadow-val-red/10 flex justify-center items-center gap-2"
-                >
-                  ゲーム開始 ({tempSettings.maxRounds}回戦)
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
-                  </svg>
-                </button>
-              </div>
-
-            </form>
-          </div>
+          <GameSetup agents={agents} onStartGame={handleStartGame} />
         ) : (
           /* ==================== 2. ゲーム進行中画面 ==================== */
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 md:gap-8 items-start">
             
-            {/* --- 左カラム (登録プレイヤー状況 / スコア操作など) (6 / 12) --- */}
+            {/* --- 左カラム (登録プレイヤー状況 / スコア操作など) --- */}
             <div className="lg:col-span-7 flex flex-col gap-6 md:gap-8">
               
               {/* 最終ラウンド終了時の優勝リザルト */}
@@ -648,15 +598,36 @@ export default function TrollWerewolfApp() {
                             <span className="text-[10px] font-mono tracking-widest text-zinc-500 uppercase block mb-2">CHAMPIONS</span>
                             <div className="flex flex-wrap justify-center gap-4">
                               {winners.map((winner) => (
-                                <div key={winner.id} className="relative group px-8 py-5 bg-yellow-500/5 border border-yellow-500/30 rounded val-clip-path min-w-[200px] flex flex-col items-center shadow-lg shadow-yellow-500/5">
+                                <div
+                                  key={winner.id}
+                                  className="relative group px-8 py-5 bg-yellow-500/5 border border-yellow-500/30 rounded val-clip-path min-w-[200px] flex flex-col items-center shadow-lg shadow-yellow-500/5 overflow-hidden"
+                                >
+                                  {/* 優勝エージェント立ち絵の背景透過表示 */}
+                                  {winner.agent?.fullPortrait && (
+                                    <div className="absolute inset-y-0 right-0 left-12 opacity-15 pointer-events-none select-none">
+                                      <img
+                                        src={winner.agent.fullPortrait}
+                                        alt={winner.agent.displayName}
+                                        className="w-full h-full object-contain object-right scale-110"
+                                      />
+                                    </div>
+                                  )}
+                                  
                                   <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-yellow-500 text-val-black text-[10px] font-black tracking-widest px-2.5 py-0.5 rounded">
                                     CHAMPION
                                   </div>
-                                  <span className="text-3xl mt-2">👑</span>
-                                  <span className="text-2xl font-bold tracking-wide mt-2 text-yellow-500">
+                                  <span className="text-3xl mt-2 z-10">👑</span>
+                                  {winner.agent && (
+                                    <img
+                                      src={winner.agent.displayIcon}
+                                      alt={winner.agent.displayName}
+                                      className="w-12 h-12 rounded border border-yellow-500/40 bg-zinc-950/80 object-cover mt-2 z-10"
+                                    />
+                                  )}
+                                  <span className="text-2xl font-bold tracking-wide mt-2 text-yellow-500 z-10">
                                     {winner.name}
                                   </span>
-                                  <span className="text-sm font-mono text-zinc-400 mt-1">
+                                  <span className="text-sm font-mono text-zinc-400 mt-1 z-10">
                                     {winner.totalScore} PTS
                                   </span>
                                 </div>
@@ -669,11 +640,18 @@ export default function TrollWerewolfApp() {
                             <span className="text-[10px] font-mono tracking-widest text-zinc-500 uppercase block mb-2">ECO AWARD (UNDERDOG)</span>
                             <div className="flex flex-wrap justify-center gap-4">
                               {underdogs.map((ud) => (
-                                <div key={ud.id} className="relative group px-6 py-4 bg-zinc-800/20 border border-zinc-700/50 rounded val-clip-path min-w-[180px] flex flex-col items-center shadow-md">
-                                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-zinc-700 text-zinc-300 text-[9px] font-black tracking-widest px-2 py-0.5 rounded">
+                                <div key={ud.id} className="relative group px-6 py-4 bg-zinc-850/20 border border-zinc-700/50 rounded val-clip-path min-w-[180px] flex flex-col items-center shadow-md">
+                                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-zinc-750 text-zinc-300 text-[9px] font-black tracking-widest px-2 py-0.5 rounded">
                                     ECO PLAYER
                                   </div>
                                   <span className="text-2xl mt-1">💀</span>
+                                  {ud.agent && (
+                                    <img
+                                      src={ud.agent.displayIcon}
+                                      alt={ud.agent.displayName}
+                                      className="w-10 h-10 rounded border border-zinc-700 bg-zinc-950/80 object-cover mt-1.5"
+                                    />
+                                  )}
                                   <span className="text-lg font-bold tracking-wide mt-1 text-zinc-400">
                                     {ud.name}
                                   </span>
@@ -697,399 +675,89 @@ export default function TrollWerewolfApp() {
                   </div>
                 </div>
               ) : (
-                /* ラウンド入力コントローラー */
-                <div className="bg-val-gray/40 border border-val-red/20 rounded p-6 backdrop-blur-md relative overflow-hidden val-clip-top-right">
-                  <div className="absolute top-0 right-0 w-24 h-1 bg-val-red"></div>
-                  
-                  {/* タイトル & ラウンド数 */}
-                  <div className="flex justify-between items-center border-b border-zinc-800 pb-4 mb-6">
-                    <div>
-                      <span className="text-val-red text-xs font-mono tracking-widest uppercase">CURRENT ROUND</span>
-                      <h2 className="text-2xl font-black tracking-wider text-val-light">
-                        第 {gameState.currentRound} 回戦 入力
-                      </h2>
-                    </div>
-                    <div className="text-right">
-                      <span className="block text-[10px] text-zinc-500 font-mono">PROGRESS</span>
-                      <span className="text-xl font-mono font-bold text-val-red">
-                        {gameState.currentRound}<span className="text-zinc-600 text-sm">/{gameState.settings.maxRounds}</span>
-                      </span>
-                    </div>
-                  </div>
-
-                  {isReadOnly ? (
-                    <div className="py-8 text-center bg-val-black/50 border border-dashed border-zinc-800 rounded">
-                      <p className="text-zinc-500 text-sm font-medium">
-                        閲覧モードのため、ラウンド結果の入力はできません。
-                      </p>
-                      <p className="text-zinc-600 text-xs mt-2">
-                        スコアを入力・編集したい場合は、上部の「編集を引き継ぐ」を押してください。
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="space-y-6">
-                      
-                      {/* Q1. 本当のトロールは誰？ */}
-                      <div>
-                        <label className="text-xs font-mono text-val-red tracking-wider uppercase block mb-2.5">
-                          Q1. 本当のトロールは誰でしたか？
-                        </label>
-                        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-                          {gameState.players.map((p) => (
-                            <button
-                              key={p.id}
-                              type="button"
-                              onClick={() => setRoundTrollId(p.id)}
-                              className={`py-2 px-3 text-xs font-bold border rounded transition-all duration-200 val-clip-path ${
-                                roundTrollId === p.id
-                                  ? "bg-val-red border-val-red text-val-light shadow-md shadow-val-red/10"
-                                  : "bg-val-black/60 border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-val-light"
-                              }`}
-                            >
-                              {p.name}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-
-                      {/* Q2. どちらが勝ちましたか？ */}
-                      <div>
-                        <label className="text-xs font-mono text-val-red tracking-wider uppercase block mb-2.5">
-                          Q2. どちらのチームが勝利しましたか？
-                        </label>
-                        <div className="grid grid-cols-2 gap-3">
-                          <button
-                            type="button"
-                            onClick={() => setRoundWinningTeam("citizen")}
-                            className={`py-3 px-4 text-xs font-black border rounded tracking-widest uppercase transition-all duration-200 val-clip-path ${
-                              roundWinningTeam === "citizen"
-                                ? "bg-val-cyan/15 border-val-cyan text-val-cyan shadow-md shadow-val-cyan/5"
-                                : "bg-val-black/60 border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-val-light"
-                            }`}
-                          >
-                            市民チームの勝ち (+{gameState.settings.scoreCitizenWin}点)
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setRoundWinningTeam("troll")}
-                            className={`py-3 px-4 text-xs font-black border rounded tracking-widest uppercase transition-all duration-200 val-clip-path ${
-                              roundWinningTeam === "troll"
-                                ? "bg-val-red/15 border-val-red text-val-red shadow-md shadow-val-red/5"
-                                : "bg-val-black/60 border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-val-light"
-                            }`}
-                          >
-                            トロールの勝ち (+{gameState.settings.scoreTrollWin}点)
-                          </button>
-                        </div>
-                      </div>
-
-                      {/* Q3. 各プレイヤーのトロール投票先 */}
-                      <div>
-                        <div className="flex justify-between items-center mb-2.5">
-                          <label className="text-xs font-mono text-val-red tracking-wider uppercase">
-                            Q3. 各プレイヤーがトロールだと思って投票した相手は？
-                          </label>
-                          <span className="text-[10px] text-zinc-500 font-mono">
-                            的中時ボーナス +{gameState.settings.scoreSpottedBonus}点 
-                            {gameState.settings.enableSpottedBonusOnLose && " (敗北時も適用)"}
-                          </span>
-                        </div>
-
-                        <div className="space-y-3 bg-val-black/40 border border-zinc-800/80 rounded p-4">
-                          {gameState.players.map((p) => {
-                            const isThisPlayerTroll = p.id === roundTrollId;
-                            return (
-                              <div key={p.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 py-1.5 border-b border-zinc-900 last:border-0">
-                                <div className="flex items-center gap-2.5">
-                                  <span className="text-xs font-semibold tracking-wide text-zinc-200">
-                                    {p.name}
-                                  </span>
-                                  {isThisPlayerTroll ? (
-                                    <span className="text-[10px] font-mono bg-val-red/20 text-val-red px-2 py-0.5 rounded border border-val-red/30">
-                                      TROLL
-                                    </span>
-                                  ) : (
-                                    <span className="text-[10px] font-mono bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded">
-                                      CITIZEN
-                                    </span>
-                                  )}
-                                </div>
-
-                                <div className="flex items-center gap-2">
-                                  <span className="text-[10px] text-zinc-500 font-mono uppercase">VOTED FOR:</span>
-                                  <select
-                                    value={roundVotes[p.id] || getDefaultVoteFor(p.id)}
-                                    onChange={(e) => {
-                                      setRoundVotes({
-                                        ...roundVotes,
-                                        [p.id]: e.target.value,
-                                      });
-                                    }}
-                                    className="bg-val-black border border-zinc-800 text-zinc-300 text-xs font-semibold rounded px-2.5 py-1.5 focus:border-val-red focus:outline-none transition-colors min-w-[140px]"
-                                  >
-                                    {gameState.players
-                                      .filter((other) => other.id !== p.id)
-                                      .map((other) => (
-                                        <option key={other.id} value={other.id}>
-                                          {other.name}
-                                        </option>
-                                      ))}
-                                  </select>
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      {/* 確定ボタン */}
-                      <button
-                        onClick={handleConfirmRound}
-                        className="w-full mt-4 bg-val-red hover:bg-val-red/90 text-val-light font-black text-sm uppercase tracking-widest py-3 transition-colors duration-300 val-clip-button border-b-4 border-black/40 shadow-xl shadow-val-red/10"
-                      >
-                        第 {gameState.currentRound} 回戦を確定する
-                      </button>
-                    </div>
-                  )}
-                </div>
+                /* ラウンド入力コントローラー (ラウンド番号をキーに指定し、ラウンド変更時にステートをリセット) */
+                <RoundInputForm
+                  key={gameState.currentRound}
+                  gameState={gameState}
+                  agents={agents}
+                  onConfirmRound={(trollId, winTeam, vts, agts, obvious, artistic) =>
+                    handleConfirmRound(trollId, winTeam, vts, agts, obvious, artistic)
+                  }
+                  isReadOnly={isReadOnly}
+                />
               )}
             </div>
 
-            {/* --- 右カラム (リアルタイムランキングスコアボード) (5 / 12) --- */}
+            {/* --- 右カラム (リアルタイムランキングスコアボード) --- */}
             <div className="lg:col-span-5 flex flex-col gap-6">
-              <div className="bg-val-gray/40 border border-zinc-800 rounded p-6 backdrop-blur-md relative overflow-hidden val-clip-top-right">
-                <div className="absolute top-0 right-0 w-24 h-1 bg-val-cyan"></div>
-                
-                <h2 className="text-xl font-bold tracking-widest text-val-cyan uppercase mb-2 flex items-center gap-2">
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 00.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z" />
-                  </svg>
-                  REAL-TIME LEADERBOARD
-                </h2>
-                <p className="text-xs text-zinc-400 mb-6 font-mono uppercase tracking-wider">
-                  SETTINGS: {gameState.settings.maxRounds} ROUNDS
-                </p>
-
-                {/* スコアリスト */}
-                <div className="space-y-3">
-                  {rankedPlayers.map((player, index) => {
-                    const rank = index + 1;
-                    let rankBadgeClass = "bg-zinc-800 text-zinc-400";
-                    let rankIcon = "";
-                    let borderClass = "border-zinc-800/80";
-
-                    if (rank === 1) {
-                      rankBadgeClass = "bg-yellow-500/20 text-yellow-500 border border-yellow-500/40";
-                      rankIcon = "👑";
-                      borderClass = "border-yellow-500/30 bg-yellow-500/5";
-                    } else if (rank === 2) {
-                      rankBadgeClass = "bg-slate-300/20 text-slate-300 border border-slate-300/40";
-                      rankIcon = "🥈";
-                      borderClass = "border-slate-300/20 bg-slate-300/5";
-                    } else if (rank === 3) {
-                      rankBadgeClass = "bg-amber-700/20 text-amber-600 border border-amber-700/40";
-                      rankIcon = "🥉";
-                      borderClass = "border-amber-700/20 bg-amber-700/5";
-                    }
-
-                    // 最下位(UNDERDOG)の判定: 少なくとも1回はゲームが進行しており、スコアが最下位値と一致する場合
-                    const isUnderdog = underdogScore !== -1 && player.totalScore === underdogScore;
-
-                    return (
-                      <div
-                        key={player.id}
-                        className={`flex items-center justify-between p-4 bg-val-black/60 border rounded transition-all duration-500 val-clip-path ${borderClass}`}
-                      >
-                        <div className="flex items-center gap-3">
-                          <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-black font-mono ${rankBadgeClass}`}>
-                            {rank}
-                          </span>
-                          <div className="flex flex-col">
-                            <span className="font-bold tracking-wide text-sm flex items-center gap-1.5">
-                              {player.name}
-                              {rankIcon && <span className="text-xs">{rankIcon}</span>}
-                              {isUnderdog && (
-                                <span className="text-[9px] font-mono font-bold bg-zinc-800/80 text-zinc-500 border border-zinc-700 px-1.5 py-0.2 rounded ml-1 animate-pulse">
-                                  UNDERDOG
-                                </span>
-                              )}
-                            </span>
-                            <span className="text-[10px] text-zinc-500 font-mono">PLAYER ID: {player.id.toUpperCase()}</span>
-                          </div>
-                        </div>
-
-                        <div className="text-right">
-                          <span className="text-xl font-bold font-mono text-val-cyan tracking-wider">
-                            {player.totalScore}
-                          </span>
-                          <span className="text-[10px] text-zinc-500 font-mono ml-1">PTS</span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
+              <Leaderboard gameState={gameState} />
             </div>
           </div>
         )}
 
         {/* ==================== 3. 履歴（ログ）エリア ==================== */}
-        {gameState && gameState.rounds.length > 0 && (
-          <div className="w-full mt-2">
-            <div className="bg-val-gray/40 border border-zinc-800 rounded p-6 backdrop-blur-md relative overflow-hidden val-clip-top-right">
-              <div className="absolute top-0 right-0 w-24 h-1 bg-zinc-600"></div>
+        {gameState && <MatchHistory gameState={gameState} />}
 
-              <h2 className="text-xl font-bold tracking-widest text-zinc-300 uppercase mb-2 flex items-center gap-2">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-                MATCH HISTORY
-              </h2>
-              <p className="text-xs text-zinc-500 mb-6 font-mono">過去ラウンドの役職・投票・ポイント獲得履歴</p>
+        {/* --- ルールブック開閉エリア (ページ下部に配置して操作を邪魔しないように改善) --- */}
+        <div className="w-full mt-4 border-t border-zinc-900 pt-6">
+          <button
+            type="button"
+            onClick={() => setIsRulebookOpen(!isRulebookOpen)}
+            className="w-full py-2.5 bg-val-cyan/10 border border-val-cyan/30 hover:border-val-cyan text-val-cyan rounded flex items-center justify-center gap-2 font-mono text-xs uppercase tracking-widest transition-all duration-300 hover:bg-val-cyan/15 hover:shadow-[0_0_15px_rgba(0,240,255,0.1)] cursor-pointer animate-fade-in"
+          >
+            <svg className={`w-4 h-4 transition-transform duration-300 ${isRulebookOpen ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+            </svg>
+            {isRulebookOpen ? "ルールブックを閉じる" : "ルールブック（遊び方・配点）を表示"}
+          </button>
 
-              <div className="space-y-3">
-                {gameState.rounds.map((round) => {
-                  const isOpen = openAccordion === round.roundNumber;
-                  const winnerText = round.winningTeam === "citizen" ? "市民チームの勝利" : "トロールの勝利";
-                  const winnerBadgeColor = round.winningTeam === "citizen" ? "bg-val-cyan/10 text-val-cyan border-val-cyan/20" : "bg-val-red/10 text-val-red border-val-red/20";
-                  const trollName = gameState.players.find((p) => p.id === round.trollPlayerId)?.name || "不明";
+          {isRulebookOpen && (
+            <div className="glass-card rounded p-6 mt-3 relative overflow-hidden val-clip-top-right border border-val-cyan/30 animate-fade-in space-y-5">
+              <div className="absolute top-0 right-0 w-24 h-1 bg-val-cyan"></div>
+              
+              {/* ルール概要 */}
+              <div>
+                <h3 className="text-sm font-bold tracking-widest text-val-cyan font-mono mb-2 uppercase">HOW TO PLAY - トロール人狼とは？</h3>
+                <p className="text-xs text-zinc-350 leading-relaxed font-mono">
+                  プレイヤーのうち1名が秘密裏に「トロール（人狼）」として指名されます。<br />
+                  市民チームは「勝利」を目指しつつ「トロール」を見破ることを目的とします。<br />
+                  トロールは「敗北」を目指しつつ、自分がトロールだとバレないように立ち回ることを目的とします。<br />
+                  全ラウンドを戦い抜き、最も獲得スコアの高いプレイヤーが優勝（景品獲得）となります！
+                </p>
+              </div>
 
-                  // このラウンド終了時点での各プレイヤーの累計スコアを計算
-                  const cumulativeScores: Record<string, number> = {};
-                  gameState.players.forEach((p) => {
-                    cumulativeScores[p.id] = 0;
-                  });
+              {/* 配点リスト (リアルタイム適用反映) */}
+              <div className="border-t border-zinc-900 pt-4">
+                <h3 className="text-sm font-bold tracking-widest text-val-red font-mono mb-3 uppercase">SCORING RULES - 配点表 (現在の設定値)</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono text-zinc-400">
+                  <div className="space-y-2">
+                    <h4 className="text-[11px] font-bold text-val-cyan tracking-wider">// 市民向けルール</h4>
+                    <ul className="space-y-1 bg-val-black/30 p-3 border border-zinc-900 rounded list-disc pl-5">
+                      <li>市民チーム勝利: <span className="text-val-cyan">+{gameState?.settings.scoreCitizenWin ?? DEFAULT_SETTINGS.scoreCitizenWin} 点</span></li>
+                      <li>トロール投票的中ボーナス: <span className="text-val-cyan">+{gameState?.settings.scoreSpottedBonus ?? DEFAULT_SETTINGS.scoreSpottedBonus} 点</span> {gameState?.settings.enableSpottedBonusOnLose ? "(敗北時も適用)" : "(敗北時は無効)"}</li>
+                      <li>市民完全勝利ボーナス (試合勝利＋投票的中): <span className="text-val-cyan">+{gameState?.settings.scoreCitizenPerfectWinBonus ?? DEFAULT_SETTINGS.scoreCitizenPerfectWinBonus} 点</span></li>
+                      <li>トロール完全勝利ペナルティ (試合敗北＋投票不的中): <span className="text-zinc-550">({gameState?.settings.scoreCitizenPerfectLosePenalty ?? DEFAULT_SETTINGS.scoreCitizenPerfectLosePenalty} 点)</span></li>
+                      <li>トロール完全隠蔽ペナルティ (試合敗北＋トロール得票0): <span className="text-zinc-550">({gameState?.settings.scoreCitizenCompleteConcealPenalty ?? DEFAULT_SETTINGS.scoreCitizenCompleteConcealPenalty} 点)</span></li>
+                    </ul>
+                  </div>
 
-                  for (let i = 0; i < round.roundNumber; i++) {
-                    const r = gameState.rounds[i];
-                    if (r) {
-                      gameState.players.forEach((p) => {
-                        const input = r.inputs[p.id];
-                        if (input) {
-                          cumulativeScores[p.id] += input.score;
-                        }
-                      });
-                    }
-                  }
-
-                  const scoresArray = Object.values(cumulativeScores);
-                  const minScoreAtRound = scoresArray.length > 0 ? Math.min(...scoresArray) : 0;
-                  const underdogsAtRound = gameState.players
-                    .filter((p) => cumulativeScores[p.id] === minScoreAtRound)
-                    .map((p) => p.name);
-
-                  const underdogText = underdogsAtRound.join(", ");
-
-                  return (
-                    <div key={round.roundNumber} className="border border-zinc-800/80 rounded bg-val-black/40 overflow-hidden val-clip-path transition-all duration-300">
-                      
-                      {/* アコーディオンヘッダー */}
-                      <button
-                        onClick={() => setOpenAccordion(isOpen ? null : round.roundNumber)}
-                        className="w-full px-5 py-3.5 flex items-center justify-between gap-4 text-left hover:bg-val-gray/25 transition-colors duration-200"
-                      >
-                        <div className="flex flex-wrap items-center gap-4">
-                          <span className="text-sm font-black font-mono text-val-red uppercase tracking-wider">
-                            第 {round.roundNumber} 回戦
-                          </span>
-                          <span className={`text-[10px] font-bold px-2 py-0.5 border rounded uppercase font-mono ${winnerBadgeColor}`}>
-                            {winnerText}
-                          </span>
-                          <span className="text-xs text-zinc-400">
-                            トロール: <span className="font-semibold text-val-light">{trollName}</span>
-                          </span>
-                          <span className="text-xs text-zinc-500 font-mono hidden sm:inline-block border-l border-zinc-850 pl-3">
-                            最下位: <span className="text-zinc-400 font-bold">{underdogText}</span> ({minScoreAtRound}点)
-                          </span>
-                        </div>
-
-                        <div className="flex items-center gap-2">
-                          <span className="text-[10px] text-zinc-500 font-mono uppercase">{isOpen ? "CLOSE" : "DETAILS"}</span>
-                          <svg
-                            className={`w-4 h-4 text-zinc-500 transition-transform duration-300 ${isOpen ? "rotate-180" : ""}`}
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                            xmlns="http://www.w3.org/2000/svg"
-                          >
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                          </svg>
-                        </div>
-                      </button>
-
-                      {/* アコーディオン詳細パネル */}
-                      {isOpen && (
-                        <div className="px-5 pb-5 pt-2 border-t border-zinc-900 bg-val-black/60 space-y-3">
-                          {/* 各ラウンド終了時点の最下位サマリー */}
-                          <div className="flex flex-wrap items-center justify-between border-b border-zinc-900/60 pb-2 text-[10px] font-mono text-zinc-500">
-                            <span>ROUND SUMMARY</span>
-                            <span>
-                              このラウンド終了時の最下位: <span className="text-val-cyan font-bold">{underdogText}</span> (累計 {minScoreAtRound} 点)
-                            </span>
-                          </div>
-                          <div className="grid grid-cols-1 sm:grid-cols-5 gap-3.5 mt-2">
-                            {gameState.players.map((p) => {
-                              const input = round.inputs[p.id];
-                              if (!input) return null;
-                              
-                              const isTroll = input.role === "troll";
-                              const votedName = gameState.players.find((vp) => vp.id === input.votedFor)?.name || "未投票";
-                              const isWin = isTroll
-                                ? round.winningTeam === "troll"
-                                : round.winningTeam === "citizen";
-                                
-                              // トロール見破り成否
-                              const isVotedTrollCorrect = !isTroll && input.votedFor === round.trollPlayerId;
-
-                              return (
-                                <div key={p.id} className="p-3.5 bg-val-gray/15 border border-zinc-800/80 rounded val-clip-path flex flex-col justify-between">
-                                  <div>
-                                    <div className="flex justify-between items-center mb-2">
-                                      <span className="font-bold text-xs tracking-wide text-val-light block truncate max-w-[80px]">
-                                        {p.name}
-                                      </span>
-                                      {isTroll ? (
-                                        <span className="text-[9px] font-mono font-bold bg-val-red/20 text-val-red border border-val-red/30 px-1.5 py-0.2 rounded">
-                                          TROLL
-                                        </span>
-                                      ) : (
-                                        <span className="text-[9px] font-mono bg-zinc-800 text-zinc-400 px-1.5 py-0.2 rounded">
-                                          CITIZEN
-                                        </span>
-                                      )}
-                                    </div>
-
-                                    {/* 投票と勝敗のログ */}
-                                    <div className="space-y-1 text-[10px] text-zinc-400 font-mono">
-                                      <div>
-                                        投票: <span className={`font-semibold ${isVotedTrollCorrect ? "text-val-cyan" : "text-zinc-400"}`}>{votedName}</span>
-                                        {isVotedTrollCorrect && <span className="ml-1 text-[8px] bg-val-cyan/15 text-val-cyan border border-val-cyan/20 px-1 rounded">的中</span>}
-                                      </div>
-                                      <div>
-                                        結果: <span className={isWin ? "text-val-cyan font-bold" : "text-zinc-600"}>{isWin ? "WIN" : "LOSE"}</span>
-                                      </div>
-                                    </div>
-                                  </div>
-
-                                  <div className="mt-3 pt-2 border-t border-zinc-900 flex justify-between items-end">
-                                    <span className="text-[9px] text-zinc-500 font-mono">SCORE:</span>
-                                    <span className={`text-base font-bold font-mono ${input.score > 0 ? "text-val-cyan" : "text-zinc-500"}`}>
-                                      +{input.score}
-                                    </span>
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
+                  <div className="space-y-2">
+                    <h4 className="text-[11px] font-bold text-val-red tracking-wider">// トロール向けルール</h4>
+                    <ul className="space-y-1 bg-val-black/30 p-3 border border-zinc-900 rounded list-disc pl-5">
+                      <li>トロールチーム勝利: <span className="text-val-cyan">+{gameState?.settings.scoreTrollWin ?? DEFAULT_SETTINGS.scoreTrollWin} 点</span></li>
+                      <li>満場一致トロールペナルティ (4票特定された場合): <span className="text-zinc-550">({gameState?.settings.scoreTrollSpottedUnanimousPenalty ?? DEFAULT_SETTINGS.scoreTrollSpottedUnanimousPenalty} 点)</span></li>
+                      <li>市民投票的中ペナルティ (投票的中時): <span className="text-zinc-550">({gameState?.settings.scoreTrollPerfectLosePenalty ?? DEFAULT_SETTINGS.scoreTrollPerfectLosePenalty} 点)</span></li>
+                      <li>トロール完全勝利ボーナス (試合勝利＋投票不中の場合): <span className="text-val-cyan">+{gameState?.settings.scoreTrollPerfectWinBonus ?? DEFAULT_SETTINGS.scoreTrollPerfectWinBonus} 点</span></li>
+                      <li>トロール完全隠蔽ボーナス (試合勝利＋得票0の場合): <span className="text-val-cyan">+{gameState?.settings.scoreTrollCompleteConcealBonus ?? DEFAULT_SETTINGS.scoreTrollCompleteConcealBonus} 点</span></li>
+                      <li>戦犯トロールペナルティ (バレバレ): <span className="text-zinc-550">({gameState?.settings.scoreTrollObviousPenalty ?? DEFAULT_SETTINGS.scoreTrollObviousPenalty} 点)</span></li>
+                      <li>芸術的トロールボーナス (神プレイ): <span className="text-val-cyan">+{gameState?.settings.scoreTrollArtisticBonus ?? DEFAULT_SETTINGS.scoreTrollArtisticBonus} 点</span></li>
+                    </ul>
+                  </div>
+                </div>
               </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </main>
 
       {/* --- フッター --- */}
