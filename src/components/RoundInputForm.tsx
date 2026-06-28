@@ -107,8 +107,9 @@ export default function RoundInputForm({ gameState, agents, onConfirmRound, isRe
   const selectedTrollPlayer = gameState.players.find((p) => p.id === roundTrollId);
 
   return (
-    <div className="glass-card rounded p-6 relative overflow-hidden val-clip-top-right transition-all duration-300 hover:shadow-[0_0_25px_rgba(255,70,85,0.05)]">
-      <div className="absolute top-0 right-0 w-24 h-1 bg-val-red"></div>
+    <>
+      <div className="glass-card rounded p-6 relative overflow-hidden val-clip-top-right transition-all duration-300 hover:shadow-[0_0_25px_rgba(255,70,85,0.05)]">
+        <div className="absolute top-0 right-0 w-24 h-1 bg-val-red"></div>
       
       {/* タイトル & ラウンド数 */}
       <div className="flex justify-between items-center border-b border-zinc-800 pb-4 mb-6">
@@ -399,8 +400,9 @@ export default function RoundInputForm({ gameState, agents, onConfirmRound, isRe
           </button>
         </div>
       )}
+      </div>
 
-      {/* エージェント選択モーダル (pb-[100%]アスペクト比ハック＆スクロール分離版) */}
+      {/* エージェント選択モーダル (親の overflow-hidden の外に出すことで、切り取られバグを完全防止) */}
       {isModalOpen && activePlayerId !== null && (
         <div className="fixed inset-0 bg-val-black/85 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-val-dark border border-val-cyan max-w-2xl w-full rounded p-6 shadow-2xl relative max-h-[85vh] flex flex-col val-clip-top-right">
@@ -499,6 +501,6 @@ export default function RoundInputForm({ gameState, agents, onConfirmRound, isRe
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }
